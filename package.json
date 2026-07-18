@@ -1,0 +1,15 @@
+{
+  "name": "escritores-hispanos-backend",
+  "version": "1.0.0",
+  "description": "Backend mínimo que conecta la app de Escritores Hispanos con la API de Claude",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "stripe": "^17.0.0",
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
