@@ -156,7 +156,7 @@ app.get('/api/verificar-pago', async (req, res) => {
   }
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n✅ Backend de Escritores Hispanos corriendo en http://localhost:${PORT}`);
   console.log(`   La app debe llamar a http://localhost:${PORT}/api/chat\n`);
