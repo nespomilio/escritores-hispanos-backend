@@ -13,7 +13,7 @@ app.use(express.json({ limit: '2mb' }));
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://iyhdldixxpzxhudcswty.supabase.co';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://iyhdldixxpxzhudcswty.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const CRON_SECRET = process.env.CRON_SECRET || 'cambia-esto';
