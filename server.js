@@ -216,6 +216,44 @@ app.post('/api/admin-stats', async (req, res) => {
   }
 });
 
+app.post('/api/audio', async (req, res) => {
+  try {
+    if (!OPENAI_API_KEY) return res.status(400).json({ error: 'Falta OPENAI_API_KEY en el servidor.' });
+    const { texto, voz } = req.body;
+
+    if (!texto || texto.length > 4096) {
+      return res.status(400).json({ error: 'El texto está vacío o supera los 4.096 caracteres permitidos por OpenAI. Prueba con un capítulo más corto.' });
+    }
+
+    const response = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'tts-1',
+        voice: voz || 'nova',
+        input: texto,
+        response_format: 'mp3'
+      })
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error('Error de la API de OpenAI (audio):', errData);
+      return res.status(response.status).json({ error: errData.error?.message || 'Error generando audio' });
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString('base64');
+    res.json({ audio_base64: base64 });
+  } catch (err) {
+    console.error('Error en /api/audio:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/enviar-recordatorios', async (req, res) => {
   try {
     if (req.query.secreto !== CRON_SECRET) {
