@@ -15,6 +15,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://iyhdldixxpzxhudcswty.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const CRON_SECRET = process.env.CRON_SECRET || 'cambia-esto';
 
 if (!ANTHROPIC_API_KEY) {
   console.error('\n⚠️  Falta la variable de entorno ANTHROPIC_API_KEY.');
@@ -34,6 +36,10 @@ if (!STRIPE_SECRET_KEY) {
 if (!SUPABASE_SERVICE_KEY) {
   console.error('\n⚠️  Falta la variable de entorno SUPABASE_SERVICE_KEY (necesaria para que el backend actualice planes).');
   console.error('   Windows (cmd):  set SUPABASE_SERVICE_KEY=tu-service-role-key-aqui\n');
+}
+if (!RESEND_API_KEY) {
+  console.error('\n⚠️  Falta la variable de entorno RESEND_API_KEY (necesaria solo para los correos de recordatorio).');
+  console.error('   Windows (cmd):  set RESEND_API_KEY=re_tu-clave-aqui\n');
 }
 
 const stripe = STRIPE_SECRET_KEY ? require('stripe')(STRIPE_SECRET_KEY) : null;
@@ -206,6 +212,63 @@ app.post('/api/admin-stats', async (req, res) => {
     });
   } catch (err) {
     console.error('Error en /api/admin-stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/enviar-recordatorios', async (req, res) => {
+  try {
+    if (req.query.secreto !== CRON_SECRET) {
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+    if (!supabaseAdmin) return res.status(400).json({ error: 'Falta SUPABASE_SERVICE_KEY.' });
+    if (!RESEND_API_KEY) return res.status(400).json({ error: 'Falta RESEND_API_KEY.' });
+
+    const hace3dias = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const hace4dias = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Usuarios inactivos entre 3 y 4 días, a quienes no se les mandó recordatorio en los últimos 7 días
+    const { data: usuarios, error } = await supabaseAdmin
+      .from('eh_perfiles')
+      .select('id, nombre, ultima_actividad, ultimo_recordatorio_enviado')
+      .lt('ultima_actividad', hace3dias)
+      .gt('ultima_actividad', hace4dias);
+
+    if (error) throw error;
+
+    const aEnviar = (usuarios || []).filter(u =>
+      !u.ultimo_recordatorio_enviado || u.ultimo_recordatorio_enviado < hace7dias
+    );
+
+    let enviados = 0;
+    for (const usuario of aEnviar) {
+      const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(usuario.id);
+      const email = authUser?.user?.email;
+      if (!email) continue;
+
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'LibroOS <onboarding@resend.dev>',
+          to: email,
+          subject: 'Tu libro te está esperando',
+          html: `<div style="font-family:sans-serif; max-width:480px; margin:0 auto;">
+            <h2 style="color:#16302e;">¿Seguimos con tu libro?</h2>
+            <p>Han pasado unos días desde tu última visita a LibroOS. Tu proyecto sigue tal como lo dejaste, listo para continuar cuando quieras.</p>
+            <a href="https://app.escritoreshispanos.com/director-editorial-app.html" style="display:inline-block; background:#d9ae57; color:#20140a; padding:12px 24px; border-radius:24px; text-decoration:none; font-weight:bold; margin-top:12px;">Continuar escribiendo →</a>
+          </div>`
+        })
+      });
+
+      await supabaseAdmin.from('eh_perfiles').update({ ultimo_recordatorio_enviado: new Date().toISOString() }).eq('id', usuario.id);
+      enviados++;
+    }
+
+    res.json({ ok: true, revisados: (usuarios || []).length, enviados });
+  } catch (err) {
+    console.error('Error en /api/enviar-recordatorios:', err);
     res.status(500).json({ error: err.message });
   }
 });
