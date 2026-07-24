@@ -156,6 +156,60 @@ app.get('/api/verificar-pago', async (req, res) => {
   }
 });
 
+app.post('/api/admin-stats', async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(400).json({ error: 'Falta SUPABASE_SERVICE_KEY en el servidor.' });
+    const { usuarioId } = req.body;
+
+    // Verifica que quien pide esto sea realmente el administrador
+    const { data: perfil, error: errPerfil } = await supabaseAdmin
+      .from('eh_perfiles').select('es_admin').eq('id', usuarioId).single();
+    if (errPerfil || !perfil || !perfil.es_admin) {
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    // ---- Datos de Supabase ----
+    const { data: perfiles } = await supabaseAdmin.from('eh_perfiles').select('plan, created_at');
+    const { data: proyectos } = await supabaseAdmin.from('eh_proyectos').select('id, created_at');
+    const { data: eventos } = await supabaseAdmin.from('eh_eventos_uso').select('herramienta, palabras, creado_en');
+
+    const usuariosPorPlan = { gratis: 0, pro: 0, premium: 0 };
+    (perfiles || []).forEach(p => { usuariosPorPlan[p.plan || 'gratis'] = (usuariosPorPlan[p.plan || 'gratis'] || 0) + 1; });
+
+    const usoPorHerramienta = {};
+    (eventos || []).forEach(e => {
+      usoPorHerramienta[e.herramienta] = (usoPorHerramienta[e.herramienta] || 0) + 1;
+    });
+
+    const hace30dias = new Date(Date.now() - 30*24*60*60*1000).toISOString();
+    const altasUltimos30 = (perfiles || []).filter(p => p.created_at > hace30dias).length;
+
+    // ---- Datos de Stripe (suscripciones activas + ingreso mensual estimado) ----
+    let stripeStats = { suscripciones_activas: 0, mrr_estimado: 0 };
+    if (stripe) {
+      const subs = await stripe.subscriptions.list({ status: 'active', limit: 100 });
+      stripeStats.suscripciones_activas = subs.data.length;
+      stripeStats.mrr_estimado = subs.data.reduce((sum, s) => {
+        const item = s.items.data[0];
+        const monto = item?.price?.unit_amount || 0;
+        return sum + (monto / 100);
+      }, 0);
+    }
+
+    res.json({
+      total_usuarios: (perfiles || []).length,
+      usuarios_por_plan: usuariosPorPlan,
+      altas_ultimos_30_dias: altasUltimos30,
+      total_proyectos: (proyectos || []).length,
+      uso_por_herramienta: usoPorHerramienta,
+      stripe: stripeStats
+    });
+  } catch (err) {
+    console.error('Error en /api/admin-stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n✅ Backend de Escritores Hispanos corriendo en http://localhost:${PORT}`);
