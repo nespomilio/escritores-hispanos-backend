@@ -167,17 +167,16 @@ app.post('/api/admin-stats', async (req, res) => {
     if (!supabaseAdmin) return res.status(400).json({ error: 'Falta SUPABASE_SERVICE_KEY en el servidor.' });
     const { usuarioId } = req.body;
 
-    // Verifica que quien pide esto sea realmente el administrador
     const { data: perfil, error: errPerfil } = await supabaseAdmin
       .from('eh_perfiles').select('es_admin').eq('id', usuarioId).single();
     if (errPerfil || !perfil || !perfil.es_admin) {
       return res.status(403).json({ error: 'No autorizado.' });
     }
 
-    // ---- Datos de Supabase ----
-    const { data: perfiles } = await supabaseAdmin.from('eh_perfiles').select('plan, created_at');
+    // ---- Datos base de Supabase ----
+    const { data: perfiles } = await supabaseAdmin.from('eh_perfiles').select('id, plan, created_at, ultima_actividad');
     const { data: proyectos } = await supabaseAdmin.from('eh_proyectos').select('id, created_at');
-    const { data: eventos } = await supabaseAdmin.from('eh_eventos_uso').select('herramienta, palabras, creado_en');
+    const { data: eventos } = await supabaseAdmin.from('eh_eventos_uso').select('usuario_id, herramienta, palabras, creado_en');
 
     const usuariosPorPlan = { gratis: 0, pro: 0, premium: 0 };
     (perfiles || []).forEach(p => { usuariosPorPlan[p.plan || 'gratis'] = (usuariosPorPlan[p.plan || 'gratis'] || 0) + 1; });
@@ -187,28 +186,83 @@ app.post('/api/admin-stats', async (req, res) => {
       usoPorHerramienta[e.herramienta] = (usoPorHerramienta[e.herramienta] || 0) + 1;
     });
 
-    const hace30dias = new Date(Date.now() - 30*24*60*60*1000).toISOString();
+    const ahora = Date.now();
+    const hace30dias = new Date(ahora - 30*24*60*60*1000).toISOString();
+    const hace7dias = new Date(ahora - 7*24*60*60*1000).toISOString();
     const altasUltimos30 = (perfiles || []).filter(p => p.created_at > hace30dias).length;
 
-    // ---- Datos de Stripe (suscripciones activas + ingreso mensual estimado) ----
-    let stripeStats = { suscripciones_activas: 0, mrr_estimado: 0 };
+    // ---- Funnel de conversión ----
+    const totalUsuarios = (perfiles || []).length;
+    const usuariosDePago = usuariosPorPlan.pro + usuariosPorPlan.premium;
+    const tasaConversion = totalUsuarios > 0 ? (usuariosDePago / totalUsuarios) * 100 : 0;
+
+    // ---- Retención (usuarios distintos con actividad reciente) ----
+    const idsActivos7 = new Set((eventos || []).filter(e => e.creado_en > hace7dias).map(e => e.usuario_id));
+    const idsActivos30 = new Set((eventos || []).filter(e => e.creado_en > hace30dias).map(e => e.usuario_id));
+
+    // ---- Palabras generadas por IA (total histórico) ----
+    const palabrasGeneradasTotal = (eventos || []).reduce((sum, e) => sum + (e.palabras || 0), 0);
+
+    // ---- Datos de Stripe: suscripciones activas, MRR, churn, ingreso acumulado ----
+    let stripeStats = {
+      suscripciones_activas: 0,
+      mrr_estimado: 0,
+      canceladas_ultimos_30_dias: 0,
+      canceladas_total: 0,
+      ingreso_acumulado: 0
+    };
     if (stripe) {
-      const subs = await stripe.subscriptions.list({ status: 'active', limit: 100 });
-      stripeStats.suscripciones_activas = subs.data.length;
-      stripeStats.mrr_estimado = subs.data.reduce((sum, s) => {
+      const subsActivas = await stripe.subscriptions.list({ status: 'active', limit: 100 });
+      stripeStats.suscripciones_activas = subsActivas.data.length;
+      stripeStats.mrr_estimado = subsActivas.data.reduce((sum, s) => {
         const item = s.items.data[0];
         const monto = item?.price?.unit_amount || 0;
         return sum + (monto / 100);
       }, 0);
+
+      const subsCanceladas = await stripe.subscriptions.list({ status: 'canceled', limit: 100 });
+      stripeStats.canceladas_total = subsCanceladas.data.length;
+      const hace30segundos = Math.floor((ahora - 30*24*60*60*1000) / 1000);
+      stripeStats.canceladas_ultimos_30_dias = subsCanceladas.data.filter(s => s.canceled_at && s.canceled_at > hace30segundos).length;
+
+      const facturas = await stripe.invoices.list({ status: 'paid', limit: 100 });
+      stripeStats.ingreso_acumulado = facturas.data.reduce((sum, f) => sum + (f.amount_paid / 100), 0);
+    }
+
+    // ---- Lista de usuarios individuales (con email) ----
+    let listaUsuarios = [];
+    try {
+      const { data: authData } = await supabaseAdmin.auth.admin.listUsers({ perPage: 1000 });
+      const emailsPorId = {};
+      (authData?.users || []).forEach(u => { emailsPorId[u.id] = u.email; });
+      listaUsuarios = (perfiles || []).map(p => ({
+        email: emailsPorId[p.id] || '(sin email)',
+        plan: p.plan || 'gratis',
+        alta: p.created_at,
+        ultima_actividad: p.ultima_actividad || null
+      })).sort((a, b) => new Date(b.alta) - new Date(a.alta));
+    } catch (e) {
+      console.error('Error listando usuarios:', e.message);
     }
 
     res.json({
-      total_usuarios: (perfiles || []).length,
+      total_usuarios: totalUsuarios,
       usuarios_por_plan: usuariosPorPlan,
       altas_ultimos_30_dias: altasUltimos30,
       total_proyectos: (proyectos || []).length,
       uso_por_herramienta: usoPorHerramienta,
-      stripe: stripeStats
+      stripe: stripeStats,
+      funnel: {
+        total: totalUsuarios,
+        usuarios_de_pago: usuariosDePago,
+        tasa_conversion: tasaConversion
+      },
+      retencion: {
+        activos_7_dias: idsActivos7.size,
+        activos_30_dias: idsActivos30.size
+      },
+      palabras_generadas_total: palabrasGeneradasTotal,
+      lista_usuarios: listaUsuarios
     });
   } catch (err) {
     console.error('Error en /api/admin-stats:', err);
