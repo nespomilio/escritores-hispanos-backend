@@ -162,6 +162,17 @@ app.get('/api/verificar-pago', async (req, res) => {
   }
 });
 
+app.get('/api/ping', async (req, res) => {
+  try {
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('eh_perfiles').select('id').limit(1);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.post('/api/admin-stats', async (req, res) => {
   try {
     if (!supabaseAdmin) return res.status(400).json({ error: 'Falta SUPABASE_SERVICE_KEY en el servidor.' });
