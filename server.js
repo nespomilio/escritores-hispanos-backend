@@ -46,7 +46,56 @@ const stripe = STRIPE_SECRET_KEY ? require('stripe')(STRIPE_SECRET_KEY) : null;
 const { createClient } = require('@supabase/supabase-js');
 const supabaseAdmin = SUPABASE_SERVICE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY) : null;
 
-app.post('/api/chat', async (req, res) => {
+// ================= SEGURIDAD =================
+// Solo usuarios con sesión iniciada en LibroOS pueden usar las rutas que gastan dinero (IA, pagos).
+// El plan se lee de la base de datos, nunca de lo que envía el navegador.
+const LIMITES_PLAN = { gratis: 3000, pro: 150000, premium: Infinity };
+const PRICE_IDS = {
+  pro: process.env.STRIPE_PRICE_PRO || 'price_1Tx5xR56RMKsYdNnBIM07lY0',
+  premium: process.env.STRIPE_PRICE_PREMIUM || 'price_1Tx5yc56RMKsYdNnKj4OnwZk'
+};
+const DIAS_PRUEBA = parseInt(process.env.DIAS_PRUEBA || '7', 10);
+
+async function requiereUsuario(req, res, next) {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Falta SUPABASE_SERVICE_KEY en el servidor.' });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'Inicia sesión para continuar.' });
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data || !data.user) return res.status(401).json({ error: 'Tu sesión ha caducado. Recarga la página e inicia sesión de nuevo.' });
+    req.usuario = data.user;
+    const { data: perfil } = await supabaseAdmin
+      .from('eh_perfiles')
+      .select('plan, es_admin, palabras_usadas_mes, mes_actual')
+      .eq('id', data.user.id)
+      .maybeSingle();
+    req.perfil = perfil || { plan: 'gratis', es_admin: false, palabras_usadas_mes: 0, mes_actual: null };
+    next();
+  } catch (err) {
+    console.error('Error verificando usuario:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+function soloPremium(req, res, next) {
+  if (req.perfil.plan !== 'premium') {
+    return res.status(403).json({ error: 'Esta función es exclusiva del plan Autor Premium.' });
+  }
+  next();
+}
+
+function dentroDelLimite(req, res, next) {
+  const limite = LIMITES_PLAN[req.perfil.plan] ?? LIMITES_PLAN.gratis;
+  const mesHoy = new Date().toISOString().slice(0, 7);
+  const usadas = req.perfil.mes_actual === mesHoy ? (req.perfil.palabras_usadas_mes || 0) : 0;
+  if (usadas >= limite) {
+    return res.status(402).json({ error: 'Has alcanzado el límite de palabras de tu plan este mes. Mejora tu plan para seguir escribiendo.' });
+  }
+  next();
+}
+// =============================================
+
+app.post('/api/chat', requiereUsuario, dentroDelLimite, async (req, res) => {
   try {
     const { system, messages } = req.body;
 
@@ -79,7 +128,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-app.post('/api/imagen', async (req, res) => {
+app.post('/api/imagen', requiereUsuario, soloPremium, async (req, res) => {
   try {
     if (!OPENAI_API_KEY) {
       return res.status(400).json({ error: 'Falta OPENAI_API_KEY en el servidor. Revisa la terminal del backend.' });
@@ -114,18 +163,22 @@ app.post('/api/imagen', async (req, res) => {
   }
 });
 
-app.post('/api/crear-checkout', async (req, res) => {
+app.post('/api/crear-checkout', requiereUsuario, async (req, res) => {
   try {
     if (!stripe) return res.status(400).json({ error: 'Falta STRIPE_SECRET_KEY en el servidor.' });
-    const { priceId, plan, usuarioId, email, returnUrl } = req.body;
+    const { plan, returnUrl } = req.body;
+    const priceId = PRICE_IDS[plan];
+    if (!priceId) return res.status(400).json({ error: 'Plan no válido.' });
+    const urlVuelta = (typeof returnUrl === 'string' && returnUrl.startsWith('https://')) ? returnUrl : 'https://app.escritoreshispanos.com/director-editorial-app.html';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
-      customer_email: email,
-      success_url: `${returnUrl}?pago=exito&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${returnUrl}?pago=cancelado`,
-      metadata: { usuario_id: usuarioId, plan }
+      customer_email: req.usuario.email,
+      ...(DIAS_PRUEBA > 0 ? { subscription_data: { trial_period_days: DIAS_PRUEBA } } : {}),
+      success_url: `${urlVuelta}?pago=exito&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${urlVuelta}?pago=cancelado`,
+      metadata: { usuario_id: req.usuario.id, plan }
     });
 
     res.json({ url: session.url });
@@ -143,7 +196,9 @@ app.get('/api/verificar-pago', async (req, res) => {
     const { session_id } = req.query;
     const session = await stripe.checkout.sessions.retrieve(session_id);
 
-    if (session.payment_status !== 'paid') {
+    const pagoOk = session.status === 'complete' &&
+      (session.payment_status === 'paid' || session.payment_status === 'no_payment_required');
+    if (!pagoOk) {
       return res.json({ ok: false, mensaje: 'El pago aún no se completó.' });
     }
 
@@ -173,14 +228,10 @@ app.get('/api/ping', async (req, res) => {
   }
 });
 
-app.post('/api/admin-stats', async (req, res) => {
+app.post('/api/admin-stats', requiereUsuario, async (req, res) => {
   try {
     if (!supabaseAdmin) return res.status(400).json({ error: 'Falta SUPABASE_SERVICE_KEY en el servidor.' });
-    const { usuarioId } = req.body;
-
-    const { data: perfil, error: errPerfil } = await supabaseAdmin
-      .from('eh_perfiles').select('es_admin').eq('id', usuarioId).single();
-    if (errPerfil || !perfil || !perfil.es_admin) {
+    if (!req.perfil.es_admin) {
       return res.status(403).json({ error: 'No autorizado.' });
     }
 
@@ -281,7 +332,7 @@ app.post('/api/admin-stats', async (req, res) => {
   }
 });
 
-app.post('/api/transcribir', async (req, res) => {
+app.post('/api/transcribir', requiereUsuario, soloPremium, async (req, res) => {
   try {
     if (!OPENAI_API_KEY) return res.status(400).json({ error: 'Falta OPENAI_API_KEY en el servidor.' });
     const { audio_base64, mime_type } = req.body;
@@ -314,7 +365,7 @@ app.post('/api/transcribir', async (req, res) => {
   }
 });
 
-app.post('/api/audio', async (req, res) => {
+app.post('/api/audio', requiereUsuario, soloPremium, async (req, res) => {
   try {
     if (!OPENAI_API_KEY) return res.status(400).json({ error: 'Falta OPENAI_API_KEY en el servidor.' });
     const { texto, voz } = req.body;
