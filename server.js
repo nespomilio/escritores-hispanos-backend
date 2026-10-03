@@ -438,7 +438,7 @@ app.get('/api/enviar-recordatorios', async (req, res) => {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          from: 'LibroOS <onboarding@resend.dev>',
+          from: process.env.EMAIL_REMITENTE || 'LibroOS <info@escritoreshispanos.com>',
           to: email,
           subject: 'Tu libro te está esperando',
           html: `<div style="font-family:sans-serif; max-width:480px; margin:0 auto;">
