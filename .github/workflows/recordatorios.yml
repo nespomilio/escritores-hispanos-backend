@@ -1,0 +1,19 @@
+name: Recordatorios LibroOS
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Despertar el servidor de Render
+        run: curl -s --max-time 120 --retry 3 --retry-delay 20 https://escritores-hispanos-backend.onrender.com/api/ping || true
+
+      - name: Enviar recordatorios
+        run: |
+          curl -sS --fail-with-body --max-time 180 --retry 2 --retry-delay 30 \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            https://escritores-hispanos-backend.onrender.com/api/enviar-recordatorios
