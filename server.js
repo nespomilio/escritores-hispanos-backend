@@ -477,7 +477,9 @@ app.post('/api/audio', requiereUsuario, soloPremium, async (req, res) => {
 
 app.get('/api/enviar-recordatorios', async (req, res) => {
   try {
-    if (req.query.secreto !== CRON_SECRET) {
+    // La contraseña puede llegar en la cabecera (preferido) o en la dirección
+    const secreto = req.headers['x-cron-secret'] || req.query.secreto;
+    if (!process.env.CRON_SECRET || secreto !== CRON_SECRET) {
       return res.status(403).json({ error: 'No autorizado.' });
     }
     if (!supabaseAdmin) return res.status(400).json({ error: 'Falta SUPABASE_SERVICE_KEY.' });
@@ -506,7 +508,7 @@ app.get('/api/enviar-recordatorios', async (req, res) => {
       const email = authUser?.user?.email;
       if (!email) continue;
 
-      await fetch('https://api.resend.com/emails', {
+      const envio = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -517,9 +519,15 @@ app.get('/api/enviar-recordatorios', async (req, res) => {
             <h2 style="color:#16302e;">¿Seguimos con tu libro?</h2>
             <p>Han pasado unos días desde tu última visita a LibroOS. Tu proyecto sigue tal como lo dejaste, listo para continuar cuando quieras.</p>
             <a href="https://app.escritoreshispanos.com/director-editorial-app.html" style="display:inline-block; background:#d9ae57; color:#20140a; padding:12px 24px; border-radius:24px; text-decoration:none; font-weight:bold; margin-top:12px;">Continuar escribiendo →</a>
+            <p style="color:#888; font-size:12px; margin-top:28px;">Si prefieres no recibir estos recordatorios, responde a este correo con la palabra «baja».</p>
           </div>`
         })
       });
+      if (!envio.ok) {
+        // Si Resend no lo envió, no se marca: se reintentará en la próxima ejecución
+        console.error('Resend rechazó un recordatorio:', envio.status, await envio.text().catch(() => ''));
+        continue;
+      }
 
       await supabaseAdmin.from('eh_perfiles').update({ ultimo_recordatorio_enviado: new Date().toISOString() }).eq('id', usuario.id);
       enviados++;
