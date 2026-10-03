@@ -8,6 +8,8 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
+// Stripe necesita el cuerpo sin procesar para comprobar la firma: esta ruta va antes de express.json
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), (req, res) => manejarWebhookStripe(req, res));
 app.use(express.json({ limit: '20mb' }));
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -66,7 +68,7 @@ async function requiereUsuario(req, res, next) {
     req.usuario = data.user;
     const { data: perfil } = await supabaseAdmin
       .from('eh_perfiles')
-      .select('plan, es_admin, palabras_usadas_mes, mes_actual')
+      .select('plan, es_admin, palabras_usadas_mes, mes_actual, stripe_customer_id')
       .eq('id', data.user.id)
       .maybeSingle();
     req.perfil = perfil || { plan: 'gratis', es_admin: false, palabras_usadas_mes: 0, mes_actual: null };
@@ -171,10 +173,16 @@ app.post('/api/crear-checkout', requiereUsuario, async (req, res) => {
     if (!priceId) return res.status(400).json({ error: 'Plan no válido.' });
     const urlVuelta = (typeof returnUrl === 'string' && returnUrl.startsWith('https://')) ? returnUrl : 'https://app.escritoreshispanos.com/director-editorial-app.html';
 
+    // Si ya paga un plan, se cambia desde el portal de Stripe (así no se cobran dos suscripciones)
+    if (req.perfil.plan !== 'gratis' && req.perfil.stripe_customer_id) {
+      const portal = await stripe.billingPortal.sessions.create({ customer: req.perfil.stripe_customer_id, return_url: urlVuelta });
+      return res.json({ url: portal.url });
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
-      customer_email: req.usuario.email,
+      ...(req.perfil.stripe_customer_id ? { customer: req.perfil.stripe_customer_id } : { customer_email: req.usuario.email }),
       ...(DIAS_PRUEBA > 0 ? { subscription_data: { trial_period_days: DIAS_PRUEBA } } : {}),
       success_url: `${urlVuelta}?pago=exito&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${urlVuelta}?pago=cancelado`,
@@ -187,6 +195,70 @@ app.post('/api/crear-checkout', requiereUsuario, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ================= SUSCRIPCIONES =================
+// Portal de Stripe: el usuario cancela, cambia de plan o actualiza su tarjeta
+app.post('/api/portal-cliente', requiereUsuario, async (req, res) => {
+  try {
+    if (!stripe) return res.status(400).json({ error: 'Falta STRIPE_SECRET_KEY en el servidor.' });
+    if (!req.perfil.stripe_customer_id) return res.status(400).json({ error: 'No tienes ninguna suscripción de pago.' });
+    const { returnUrl } = req.body || {};
+    const urlVuelta = (typeof returnUrl === 'string' && returnUrl.startsWith('https://')) ? returnUrl : 'https://app.escritoreshispanos.com/director-editorial-app.html';
+    const portal = await stripe.billingPortal.sessions.create({ customer: req.perfil.stripe_customer_id, return_url: urlVuelta });
+    res.json({ url: portal.url });
+  } catch (err) {
+    console.error('Error en /api/portal-cliente:', err.message);
+    res.status(500).json({ error: 'No se pudo abrir la gestión de la suscripción.' });
+  }
+});
+
+// El mejor plan que tiene activo un cliente en Stripe (activo, en prueba o con un cobro reintentándose)
+async function planSegunStripe(customerId) {
+  const rango = { gratis: 0, pro: 1, premium: 2 };
+  let mejor = 'gratis';
+  const subs = await stripe.subscriptions.list({ customer: customerId, status: 'all', limit: 20 });
+  for (const s of subs.data) {
+    if (!['active', 'trialing', 'past_due'].includes(s.status)) continue;
+    for (const item of s.items.data) {
+      const plan = Object.keys(PRICE_IDS).find(k => PRICE_IDS[k] === item.price.id);
+      if (plan && rango[plan] > rango[mejor]) mejor = plan;
+    }
+  }
+  return mejor;
+}
+
+// Avisos automáticos de Stripe: pagos, cambios de plan, cancelaciones y fin de la prueba
+async function manejarWebhookStripe(req, res) {
+  if (!stripe || !supabaseAdmin) return res.status(500).send('Servidor sin configurar');
+  const secreto = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secreto) return res.status(500).send('Falta STRIPE_WEBHOOK_SECRET');
+  let evento;
+  try {
+    evento = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], secreto);
+  } catch (err) {
+    console.error('Webhook de Stripe con firma no válida:', err.message);
+    return res.status(400).send('Firma no válida');
+  }
+  try {
+    const obj = evento.data.object;
+    if (evento.type === 'checkout.session.completed') {
+      // Respaldo por si el usuario cierra la pestaña antes de volver a LibroOS
+      const { usuario_id, plan } = obj.metadata || {};
+      if (usuario_id && PRICE_IDS[plan] && obj.customer) {
+        await supabaseAdmin.from('eh_perfiles').update({ plan, stripe_customer_id: obj.customer }).eq('id', usuario_id);
+      }
+    } else if (['customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted'].includes(evento.type)) {
+      const plan = await planSegunStripe(obj.customer);
+      await supabaseAdmin.from('eh_perfiles').update({ plan }).eq('stripe_customer_id', obj.customer);
+      console.log(`Stripe ${evento.type}: cliente ${obj.customer} queda en plan ${plan}`);
+    }
+    res.json({ recibido: true });
+  } catch (err) {
+    console.error('Error procesando webhook de Stripe:', err);
+    res.status(500).send('Error');
+  }
+}
+// =================================================
 
 app.get('/api/verificar-pago', async (req, res) => {
   try {
